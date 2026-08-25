@@ -3257,6 +3257,7 @@ def test_abort_request_when_structured_output_fsm_cannot_advance():
     request.structured_output_request = Mock()
     request.structured_output_request.grammar = Mock(spec=StructuredOutputGrammar)
     request.structured_output_request.grammar.accept_tokens.return_value = False
+    request.structured_output_request.grammar.validate_tokens.return_value = []
     request.status = RequestStatus.RUNNING
     request.num_computed_tokens = request.num_tokens
 
@@ -3329,6 +3330,93 @@ def test_abort_request_when_structured_output_fsm_cannot_advance():
     assert engine_core_output.request_id == request.request_id
     assert engine_core_output.new_token_ids == [123]
     assert engine_core_output.finish_reason == FinishReason.ERROR
+
+
+def test_structured_output_keeps_grammar_valid_spec_prefix():
+    """A spec window that is only a grammar prefix must not HTTP 500 (#52620)."""
+    scheduler = object.__new__(Scheduler)
+    sampling_params = SamplingParams(ignore_eos=True, max_tokens=16)
+    sampling_params.update_from_generation_config({}, EOS_TOKEN_ID)
+
+    request = Request(
+        request_id="0",
+        prompt_token_ids=[0, 1],
+        mm_features=None,
+        sampling_params=sampling_params,
+        pooling_params=None,
+    )
+    request.structured_output_request = Mock()
+    request.structured_output_request.grammar = Mock(spec=StructuredOutputGrammar)
+    request.structured_output_request.grammar.validate_tokens.return_value = [10]
+    request.structured_output_request.grammar.accept_tokens.return_value = True
+    request.status = RequestStatus.RUNNING
+    request.num_computed_tokens = request.num_tokens
+
+    scheduler.perf_metrics = None
+    scheduler.connector = None
+    scheduler.ec_connector = None
+    scheduler.structured_output_manager = Mock()
+    scheduler.structured_output_manager.should_advance.return_value = True
+    scheduler.structured_output_manager.trim_reasoning_for_advance.side_effect = (
+        lambda request, new_token_ids: new_token_ids
+    )
+    scheduler.requests = {request.request_id: request}
+    scheduler.running = [request]
+    scheduler.waiting = Mock()
+    scheduler.kv_cache_manager = Mock()
+    scheduler.kv_cache_manager.take_events.return_value = None
+    scheduler.kv_cache_manager.estimate_cached_tokens.return_value = 0
+    scheduler.kv_event_publisher = Mock()
+    scheduler.finished_req_ids = set()
+    scheduler.finished_req_ids_dict = None
+    scheduler.grammar_compile_error_reqs = set()
+    scheduler.vllm_config = Mock()
+    scheduler.vllm_config.model_config.enable_return_routed_experts = False
+    scheduler.enable_return_routed_experts = False
+    scheduler.return_sampling_mask = False
+    scheduler.recompute_kv_load_failures = False
+    scheduler.defer_block_free = False
+    scheduler.make_stats = Mock(return_value=None)
+    scheduler.make_spec_decoding_stats = Mock(return_value=None)
+    scheduler.max_model_len = 128
+    scheduler.block_size = 16
+    scheduler.num_sampled_tokens_per_step = 1
+    scheduler.is_encoder_only = False
+    scheduler._free_request = Mock()
+
+    output = SchedulerOutput(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_scheduled_tokens={request.request_id: 3},
+        total_num_scheduled_tokens=3,
+        scheduled_encoder_inputs={},
+        scheduled_spec_decode_tokens={request.request_id: [11, 12]},
+        num_common_prefix_blocks=[],
+        finished_req_ids=set(),
+        free_encoder_mm_hashes=[],
+    )
+    model_runner_output = ModelRunnerOutput(
+        req_ids=[request.request_id],
+        req_id_to_index={request.request_id: 0},
+        sampled_token_ids=[[10, 11, 12]],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+
+    engine_core_outputs = scheduler.update_from_output(output, model_runner_output)
+
+    request.structured_output_request.grammar.validate_tokens.assert_called_once_with(
+        [10, 11, 12]
+    )
+    request.structured_output_request.grammar.accept_tokens.assert_called_once_with(
+        request.request_id, [10]
+    )
+    assert request.status == RequestStatus.RUNNING
+    assert request.output_token_ids == [10]
+    assert request.request_id in scheduler.requests
+    scheduler._free_request.assert_not_called()
+    assert engine_core_outputs[0].outputs[0].new_token_ids == [10]
 
 
 @pytest.mark.parametrize("use_v2_model_runner", [False, True])

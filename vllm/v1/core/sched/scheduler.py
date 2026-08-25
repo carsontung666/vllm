@@ -1905,18 +1905,37 @@ class Scheduler(SchedulerInterface):
                         request, new_token_ids
                     )
                 )
-                if advance_token_ids and not grammar.accept_tokens(
-                    req_id, advance_token_ids
-                ):
-                    logger.error(
-                        "Unexpected: grammar rejected tokens %s for request %s. "
-                        "Terminating request.",
-                        advance_token_ids,
-                        req_id,
-                    )
-                    request.status = RequestStatus.FINISHED_ERROR
-                    request.resumable = False
-                    stopped = True
+                if advance_token_ids:
+                    accepted_ids = grammar.validate_tokens(advance_token_ids)
+                    extra = len(advance_token_ids) - len(accepted_ids)
+                    # Spec decode can propose a window that is only a grammar
+                    # prefix. Keep that prefix instead of HTTP 500 (#52620).
+                    if extra > 0 and accepted_ids:
+                        if self._can_drop_output_suffix(request, extra):
+                            self._drop_output_suffix(request, extra)
+                            new_token_ids = new_token_ids[: len(new_token_ids) - extra]
+                            logger.warning(
+                                "Grammar rejected %d speculative token(s) for "
+                                "request %s; kept the valid prefix %s.",
+                                extra,
+                                req_id,
+                                accepted_ids,
+                            )
+                            advance_token_ids = accepted_ids
+                        else:
+                            accepted_ids = []
+                    if accepted_ids and not grammar.accept_tokens(req_id, accepted_ids):
+                        accepted_ids = []
+                    if not accepted_ids:
+                        logger.error(
+                            "Unexpected: grammar rejected tokens %s for "
+                            "request %s. Terminating request.",
+                            advance_token_ids,
+                            req_id,
+                        )
+                        request.status = RequestStatus.FINISHED_ERROR
+                        request.resumable = False
+                        stopped = True
 
             routed_experts = None
             if (
@@ -2178,6 +2197,22 @@ class Scheduler(SchedulerInterface):
 
         self._enqueue_waiting_request(request)
         return False
+
+    def _can_drop_output_suffix(self, request: Request, num_tokens: int) -> bool:
+        """True if dropping the last ``num_tokens`` outputs stays in-block."""
+        if num_tokens <= 0 or num_tokens > len(request.output_token_ids):
+            return False
+        old_len = len(request.all_token_ids)
+        new_len = old_len - num_tokens
+        if new_len < request.num_prompt_tokens:
+            return False
+        block_size = self.block_size
+        return old_len // block_size == new_len // block_size
+
+    def _drop_output_suffix(self, request: Request, num_tokens: int) -> None:
+        del request._output_token_ids[-num_tokens:]
+        del request._all_token_ids[-num_tokens:]
+        request.num_computed_tokens = max(0, request.num_computed_tokens - num_tokens)
 
     def _update_request_with_output(
         self, request: Request, new_token_ids: list[int], is_stale: bool = False
